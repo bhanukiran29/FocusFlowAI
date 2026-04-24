@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+*.pyc
+.env
+calls.db
+static/*.mp3
+static/cache_*.mp3
+input_*.wav
+clean_*.wav
+*.wav
+.vscode/
+.idea/
+*.log
