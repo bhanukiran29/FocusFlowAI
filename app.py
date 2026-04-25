@@ -13,6 +13,8 @@ import whisper
 import shutil
 from pydub import AudioSegment
 from gtts import gTTS
+import edge_tts
+import asyncio
 from dotenv import load_dotenv
 
 # ---------------- LOAD ENV ----------------
@@ -683,30 +685,33 @@ def process_audio(recording_url, call_sid="default", attempt=1):
         tts_start = time.time()
         out_file = f"static/{call_sid}.mp3"
         
-        # TEXT -> SPEECH (gTTS) with guaranteed MP3 🎤
+        # TEXT -> SPEECH (Edge TTS) with high-quality neural voices 🎤
         tts_start = time.time()
-        
-        lang_map = {
-            "hi": "hi",
-            "kn": "kn",
-            "mr": "mr",
-            "ta": "ta",
-            "te": "te",
-            "ur": "ur",
-            "bn": "bn",
-            "gu": "gu",
-            "en": "en"
-        }
-        tts_lang = lang_map.get(lang, "en")
         out_file = f"static/{call_sid}.mp3"
+        
+        edge_voice_map = {
+            "hi": "hi-IN-MadhurNeural",
+            "kn": "kn-IN-GaganNeural",
+            "mr": "mr-IN-ManoharNeural",
+            "ta": "ta-IN-PallaviNeural",
+            "te": "te-IN-MohanNeural",
+            "ur": "ur-IN-SalmanNeural",
+            "bn": "bn-IN-BashkarNeural",
+            "gu": "gu-IN-NiranjanNeural",
+            "en": "en-US-AvaNeural"
+        }
+        tts_voice = edge_voice_map.get(lang, "en-US-AvaNeural")
 
         try:
-            tts = gTTS(text=reply_local, lang=tts_lang)
-            tts.save(out_file)
-            print(f"[DEBUG] TTS SUCCESS ({tts_lang})")
+            communicate = edge_tts.Communicate(reply_local, tts_voice)
+            asyncio.run(communicate.save(out_file))
+            print(f"[DEBUG] Edge TTS SUCCESS ({tts_voice})")
         except Exception as e:
-            print(f"TTS failed, fallback to English: {e}")
-            gTTS(text=reply_en, lang="en").save(out_file)
+            print(f"Edge TTS failed, fallback to gTTS: {e}")
+            try:
+                gTTS(text=reply_local, lang=lang if lang in ["hi", "kn", "en"] else "en").save(out_file)
+            except:
+                gTTS(text=reply_en, lang="en").save(out_file)
         
         t_tts = round(time.time() - tts_start, 2)
         
