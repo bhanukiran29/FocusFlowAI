@@ -195,10 +195,8 @@ def call_me():
 def voice():
     r = VoiceResponse()
 
-    r.say(
-        "Hello. You have a new order. One pizza and one coke. "
-        "Please say yes to confirm, or no to cancel. You can speak in your language."
-    )
+    # English intro (OK to use .say here)
+    r.say("Hello. You have a new order. Please say yes to confirm or no to cancel.")
 
     r.record(
         action=f"{PUBLIC_URL}/process?a=1",  # 5) Start with attempt=1
@@ -350,18 +348,48 @@ def normalize(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
-# 4) CACHE COMMON PHRASES (faster playback, fewer TTS calls) 💾
+# 4) PRE-TRANSLATED RESPONSES (Avoid API Quotas) 💾
+PRE_TRANSLATED = {
+    "hi": {
+        "confirmed": "आपका ऑर्डर पुष्टि हो गया है। धन्यवाद।",
+        "cancelled": "आपका ऑर्डर रद्द कर दिया गया है।",
+        "unclear": "क्षमा करें, मुझे समझ नहीं आया। कृपया हाँ या नहीं कहें।"
+    },
+    "kn": {
+        "confirmed": "ನಿಮ್ಮ ಆದೇಶ ದೃಢೀకರಿಸಲಾಗಿದೆ. ಧನ್ಯವಾದಗಳು.",
+        "cancelled": "ನಿಮ್ಮ ಆದೇಶ ರದ್ದುಪಡಿಸಲಾಗಿದೆ.",
+        "unclear": "ಕ್ಷಮಿಸಿ, ನಾನು ಅರ್ಥ ಮಾಡಲಿಲ್ಲ. ದಯವಿಟ್ಟು ಹೌದು ಅಥವಾ ಇಲ್ಲ ಎಂದು ಹೇಳಿ."
+    },
+    "ta": {
+        "confirmed": "உங்கள் ஆர்டர் உறுதி செய்யப்பட்டது. நன்றி.",
+        "cancelled": "உங்கள் ஆர்டர் ரத்து செய்யப்பட்டது.",
+        "unclear": "மன்னிக்கவும், எனக்குப் புரியவில்லை. ஆம் அல்லது இல்லை என்று சொல்லுங்கள்."
+    },
+    "te": {
+        "confirmed": "మీ ఆర్డర్ ఖరారైంది. ధన్యవాదాలు.",
+        "cancelled": "మీ ఆర్డర్ రద్దు చేయబడింది.",
+        "unclear": "క్షమించండి, నాకు అర్థం కాలేదు. అవును లేదా కాదు అని చెప్పండి."
+    },
+    "mr": {
+        "confirmed": "तुमची ऑर्डर कन्फर्म झाली आहे. धन्यवाद.",
+        "cancelled": "तुमची ऑर्डर रद्द झाली आहे.",
+        "unclear": "क्षमस्व, मला समजले नाही. कृपया होय किंवा नाही म्हणा."
+    }
+}
+
+# 4) DISABLE CACHE FOR NOW (resolves language playback issues)
+"""
 CACHE = {
     ("en", "confirmed"): "static/cache_en_confirmed.mp3",
-    ("en", "cancelled"): "static/cache_en_cancelled.mp3",
-    ("en", "unclear"): "static/cache_en_unclear.mp3",
-    ("kn", "confirmed"): "static/cache_kn_confirmed.mp3",
-    ("kn", "cancelled"): "static/cache_kn_cancelled.mp3",
-    ("kn", "unclear"): "static/cache_kn_unclear.mp3",
-    ("hi", "confirmed"): "static/cache_hi_confirmed.mp3",
-    ("hi", "cancelled"): "static/cache_hi_cancelled.mp3",
-    ("hi", "unclear"): "static/cache_hi_unclear.mp3",
-}
+...
+"""
+
+# Pre-generate intro audio on startup (No longer used, using .say for English intro)
+"""
+def init_intro():
+    ...
+init_intro()
+"""
 
 
 # Pre-generate cache files on startup (if needed)
@@ -391,13 +419,14 @@ def init_cache():
 
 
 # Call cache init on startup
-init_cache()
+# init_cache()
 
 
 # ---------------- BACKGROUND TASK ----------------
 def process_audio(recording_url, call_sid="default", attempt=1):
     start_time = time.time()
     confidence = "unknown"  # 6) Track confidence for dashboard
+    avg_logprob = -1.0  # Initialize to avoid UnboundLocalError
     try:
         t_stt = 0
         t_ai = 0
@@ -450,59 +479,80 @@ def process_audio(recording_url, call_sid="default", attempt=1):
         # 1) WHISPER: Force language detection with confidence checking 🎯
         if not skip_to_tts:
             stt_start = time.time()
+
             try:
                 result = whisper_model.transcribe(
                     clean_file,
                     task="transcribe",
-                    language=None,  # Let it detect
+                    language=None,
                     fp16=False
                 )
-                user_text = result["text"].strip()
+
+                user_text = result.get("text", "").strip()
                 lang = result.get("language", "en")
-                
-                # Extract avg_logprob from segments if not at top level
+
+                avg_logprob = -1.0
+
                 segments = result.get("segments", [])
                 if segments:
-                    avg_logprob = sum(s.get("avg_logprob", 0) for s in segments) / len(segments)
-                else:
-                    avg_logprob = result.get("avg_logprob", -1)
-                
-                # 2) SMARTER confidence check: don't over-reject short audio on 8kHz phone lines
-                # Only strict reject if: empty text OR (longer phrase AND very low confidence)
-                if not user_text.strip():
-                    print(f"[{call_sid}] ⚠️ Empty text, treating as unclear")
-                    user_text = "[Unclear/Noisy]"
+                    avg_logprob = sum(
+                        s.get("avg_logprob", -1) for s in segments
+                    ) / len(segments)
+
+                if avg_logprob is None:
+                    avg_logprob = -1.0
+
+                text_lower = user_text.lower()
+
+                # 🔥 Override Whisper mistakes (VERY IMPORTANT)
+                if any(x in text_lower for x in ["yes", "no", "confirm", "order", "cancel", "yeah", "yep"]):
+                    lang = "en"
+                elif any(x in text_lower for x in ["haan", "nahi", "hai", "haan ji"]):
+                    lang = "hi"
+                elif any(x in text_lower for x in ["haudu", "illa", "beda", "adu", "beku"]):
+                    lang = "kn"
+                elif any(x in text_lower for x in ["hoy", "nako"]):
+                    lang = "mr"
+
+                print(f"[DEBUG] USER TEXT: {user_text}")
+                print(f"[DEBUG] LANG: {lang}")
+                print(f"[DEBUG] CONF: {avg_logprob:.2f}")
+
+                if not user_text:
                     decision = "unclear"
                     confidence = "low"
+
                 elif avg_logprob < -1.5 and len(user_text.split()) > 2:
-                    # Only reject longer, low-confidence phrases
-                    print(f"[{call_sid}] ⚠️ Low confidence on long phrase ({avg_logprob}), treating as unclear")
                     decision = "unclear"
                     confidence = "low"
+
                 else:
-                    # Set confidence level based on logprob
                     if avg_logprob > -1.0:
                         confidence = "high"
                     elif avg_logprob > -1.5:
                         confidence = "medium"
                     else:
                         confidence = "low"
-                    decision = None  # Will be determined below
-                
-                print(f"[{call_sid}] User said: {user_text}")
-                print(f"[{call_sid}] Detected language: {lang}, confidence: {avg_logprob:.2f}")
+
+                    decision = None
+
             except Exception as stt_e:
-                print(f"[{call_sid}] Whisper error: {stt_e}")
-                user_text = "[Inaudible/Error]"
+                print(f"[ERROR] Whisper failed: {stt_e}")
+                user_text = "[Error]"
                 lang = "en"
                 decision = "unclear"
                 confidence = "low"
-            
+                avg_logprob = -1.0
+
             t_stt = round(time.time() - stt_start, 2)
+
         else:
-            avg_logprob = -1
+            user_text = ""
+            lang = "en"
+            decision = "unclear"
+            confidence = "low"
+            avg_logprob = -1.0
             t_stt = 0
-        
         # Clean up audio files
         try:
             os.remove(input_file)
@@ -515,45 +565,55 @@ def process_audio(recording_url, call_sid="default", attempt=1):
         if decision is None or decision != "unclear":  # Determine decision if not already set
             # 3) Normalize text for consistent keyword matching
             t = normalize(user_text)
-            t_lower = t.lower()
-            
-            # Handle silence/unclear cases
-            if not t or t in ["uh", "um"]:
-                decision = "unclear"
-            
-            # Kannada (native script + romanized with variants) 🔤
-            elif any(x in t for x in ["ಹೌದು", "haudu", "houdu", "haudu sir", "houdhu", "hudu", "hou", "hao"]):
+            t = normalize(user_text)
+
+            # ---------- YES ----------
+            if any(x in t for x in [
+                # English
+                "yes", "yeah", "yep", "ok", "okay", "confirm",
+
+                # Hindi
+                "हाँ", "haan", "ha", "जी", "ji", "bilkul", "theek",
+
+                # Kannada
+                "ಹೌದು", "haudu", "houdu",
+
+                # Marathi
+                "होय", "hoy", "hoo", "ya", "thik",
+
+                # Tamil
+                "ஆம்", "aam", "ama", "aama",
+
+                # Telugu
+                "అవును", "avunu"
+            ]):
                 decision = "confirmed"
-            elif any(x in t for x in ["ಇಲ್ಲ", "illa", "ಬೇಡ", "beda", "bedi", "bedu"]):
+
+            # ---------- NO ----------
+            elif any(x in t for x in [
+                # English
+                "no", "nope", "cancel", "stop",
+
+                # Hindi
+                "नहीं", "nahi", "nai", "na", "nehi",
+
+                # Kannada
+                "ಇಲ್ಲ", "illa", "beda",
+
+                # Marathi
+                "नाही", "nahi", "nako",
+
+                # Tamil
+                "இல்லை", "illai", "venam", "venda",
+
+                # Telugu
+                "కాదు", "kaadu", "ledu"
+            ]):
                 decision = "cancelled"
-            
-            # Hindi (native script + romanized with variants) 🔤
-            elif any(x in t for x in ["हाँ", "haan", "ha", "जी", "ji", "bilkul", "theek", "han", "ha ji", "haji"]):
-                decision = "confirmed"
-            elif any(x in t for x in ["नहीं", "nahi", "nai", "ना", "na", "nehi", "na ji", "naji"]):
-                decision = "cancelled"
-            
-            # Marathi (native script + romanized) 🔤
-            elif any(x in t for x in ["होय", "hoy", "ya", "ठीक", "thik", "ok", "hoo", "hoy ji"]):
-                decision = "confirmed"
-            elif any(x in t for x in ["नाही", "nahi", "na", "nako", "nako ji"]):
-                decision = "cancelled"
-            
-            # Tamil (native script + romanized) 🔤
-            elif any(x in t for x in ["ஆம்", "aam", "ama", "aama", "om", "amaam"]):
-                decision = "confirmed"
-            elif any(x in t for x in ["இல்லை", "illai", "venda", "venam", "வேண்டாம்", "வேணாம்", "வேண்டா", "வேடா", "இல்ல", "illa", "vendaam"]):
-                decision = "cancelled"
-            
-            # English keywords (fallback, including romanized Indian)
-            elif any(x in t_lower for x in ["yes", "confirm", "ok", "affirmative", "roger", "agreed", "haudu", "haan", "hoy", "aam", "ji", "theek", "bilkul", "han", "ha ji", "hou", "ama"]):
-                decision = "confirmed"
-            elif any(x in t_lower for x in ["no", "cancel", "decline", "negative", "rejected", "illa", "nahi", "na", "illai", "venda", "nako", "venam", "beda", "bedu", "nehi"]):
-                decision = "cancelled"
-            
+
             else:
                 decision = "unclear"
-        
+
         # 3) Double-check for short utterances (1-2 words)
         word_count = len(user_text.split())
         if word_count <= 2 and decision == "unclear":
@@ -589,11 +649,26 @@ def process_audio(recording_url, call_sid="default", attempt=1):
             lang_name = lang_name_map.get(lang, lang)
             
             if lang != "en":
-                translate_prompt = f"Translate the following phrase into {lang_name}. ONLY return the direct translation. Do not include any explanations, alternatives, or extra text.\n\nPhrase: {reply_en}"
-                response = gemini_model.generate_content(translate_prompt)
-                reply_local = response.text.strip()
-                # Clean up potential markdown formatting or quotes from Gemini
-                reply_local = re.sub(r'["\']', '', reply_local).split('\n')[0].strip()
+                # Check for pre-translated response first to save API quota
+                lang_replies = PRE_TRANSLATED.get(lang)
+                if lang_replies and decision and decision in lang_replies:
+                    reply_local = lang_replies[decision]
+                    print(f"[DEBUG] Using PRE-TRANSLATED: {reply_local}")
+                else:
+                    try:
+                        translate_prompt = f"""
+                        Translate this into {lang_name}. Only give the translated sentence:
+
+                        {reply_en}
+                        """
+                        response = gemini_model.generate_content(translate_prompt)
+                        reply_local = response.text.strip()
+                        # Clean up potential markdown formatting or quotes from Gemini
+                        reply_local = re.sub(r'["\']', '', reply_local).split('\n')[0].strip()
+                        print(f"[DEBUG] TRANSLATED (Gemini): {reply_local}")
+                    except Exception as e:
+                        print(f"[ERROR] Gemini quota or error: {e}")
+                        reply_local = reply_en
             else:
                 reply_local = reply_en
                 
@@ -608,43 +683,30 @@ def process_audio(recording_url, call_sid="default", attempt=1):
         tts_start = time.time()
         out_file = f"static/{call_sid}.mp3"
         
-        # TEXT -> SPEECH (gTTS) with caching & guaranteed MP3 🎤
+        # TEXT -> SPEECH (gTTS) with guaranteed MP3 🎤
         tts_start = time.time()
         
-        # 1) Verify TTS language mapping with proper logging
-        lang_gtts_map = {"kn": "kn", "hi": "hi", "mr": "mr", "ta": "ta", "te": "te", "ur": "ur", "bn": "bn", "gu": "gu", "en": "en"}
-        tts_lang = lang_gtts_map.get(lang, "en")
-        print(f"[{call_sid}] TTS lang={tts_lang}")  # Log it once
-        
-        # 4) Check cache first (faster playback, fewer TTS calls) 💾
-        cache_key = (tts_lang, decision)
-        out_file = CACHE.get(cache_key)
-        
-        if out_file and os.path.exists(out_file):
-            # Use cached file - Copy it to static/{call_sid}.mp3 so response logic finds it
-            print(f"[{call_sid}] 💾 Using cached TTS: {cache_key}")
-            target_file = f"static/{call_sid}.mp3"
-            shutil.copy(out_file, target_file)
-            out_file = target_file
-        else:
-            # Generate new TTS file
-            out_file = f"static/{call_sid}.mp3"
-            try:
-                tts = gTTS(text=reply_local, lang=tts_lang)
-                tts.save(out_file)
-                print(f"[{call_sid}] ✅ TTS generated")
-            except Exception as e:
-                # 1) Guarantee TTS always returns playable MP3 🔒
-                print(f"[{call_sid}] TTS error, fallback to EN: {e}")
-                try:
-                    gTTS(text=reply_en, lang="en").save(out_file)
-                    print(f"[{call_sid}] ✅ Fallback TTS saved")
-                except Exception as fallback_e:
-                    print(f"[{call_sid}] ❌ TTS fallback failed: {fallback_e}")
-        
-        # 1) ASSERT: MP3 file MUST exist
-        assert os.path.exists(out_file), f"[{call_sid}] MP3 not created: {out_file}"
-        print(f"[{call_sid}] ✅ MP3 guaranteed: {out_file}")
+        lang_map = {
+            "hi": "hi",
+            "kn": "kn",
+            "mr": "mr",
+            "ta": "ta",
+            "te": "te",
+            "ur": "ur",
+            "bn": "bn",
+            "gu": "gu",
+            "en": "en"
+        }
+        tts_lang = lang_map.get(lang, "en")
+        out_file = f"static/{call_sid}.mp3"
+
+        try:
+            tts = gTTS(text=reply_local, lang=tts_lang)
+            tts.save(out_file)
+            print(f"[DEBUG] TTS SUCCESS ({tts_lang})")
+        except Exception as e:
+            print(f"TTS failed, fallback to English: {e}")
+            gTTS(text=reply_en, lang="en").save(out_file)
         
         t_tts = round(time.time() - tts_start, 2)
         
