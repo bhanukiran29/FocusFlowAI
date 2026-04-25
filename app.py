@@ -542,7 +542,18 @@ def process_audio(recording_url, call_sid="default", attempt=1):
                 print(f"[DEBUG] LANG: {lang}")
                 print(f"[DEBUG] CONF: {avg_logprob:.2f}")
 
-                if not user_text:
+                # 🛑 FINAL SAFETY: Force language into our 4 supported ones
+                if lang not in ["en", "hi", "kn", "mr"]:
+                    print(f"[{call_sid}] ⚠️ Unsupported lang '{lang}' detected, forcing to English")
+                    lang = "en"
+
+                # 🛑 HALLUCINATION FILTER: If text is garbage or repetitive characters
+                if not user_text or re.search(r"[^\w\s,.?]{3,}", user_text) or len(set(user_text.replace(" ", ""))) < 3 and len(user_text) > 10:
+                    print(f"[{call_sid}] ⚠️ Hallucination detected, treating as unclear")
+                    decision = "unclear"
+                    confidence = "low"
+
+                elif not user_text.strip():
                     decision = "unclear"
                     confidence = "low"
 
