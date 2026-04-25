@@ -350,7 +350,34 @@ def normalize(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
-# 4) PRE-TRANSLATED RESPONSES (Avoid API Quotas) 💾
+def detect_language_by_script(text, default="en"):
+    """Infer language from Unicode script and strong keyword signals."""
+    if not text:
+        return default
+
+    if re.search(r"[\u0C80-\u0CFF]", text):
+        return "kn"
+    if re.search(r"[\u0900-\u097F]", text):
+        # Hindi and Marathi share Devanagari script; use known Marathi-specific words first.
+        if any(x in text for x in ["होय", "नकाशी", "नको", "हो"]):
+            return "mr"
+        return "hi"
+    if re.search(r"[A-Za-z]", text):
+        return "en"
+
+    return default
+
+
+def detect_whisper_language(result, default="en"):
+    """Pick the best Whisper language info available."""
+    language = result.get("language") or default
+    if not language:
+        probs = result.get("language_probs")
+        if isinstance(probs, list) and probs:
+            best = max(probs, key=lambda x: x.get("prob", 0))
+            language = best.get("language", default)
+    return language
+
 PRE_TRANSLATED = {
     "hi": {
         "confirmed": "आपका ऑर्डर पुष्टि हो गया है। धन्यवाद।",
@@ -358,19 +385,9 @@ PRE_TRANSLATED = {
         "unclear": "क्षमा करें, मुझे समझ नहीं आया। कृपया हाँ या नहीं कहें।"
     },
     "kn": {
-        "confirmed": "ನಿಮ್ಮ ಆದೇಶ ದೃಢೀకರಿಸಲಾಗಿದೆ. ಧನ್ಯವಾದಗಳು.",
+        "confirmed": "ನಿಮ್ಮ ಆದೇಶ ದೃಢೀಕರಿಸಲಾಗಿದೆ. ಧನ್ಯವಾದಗಳು.",
         "cancelled": "ನಿಮ್ಮ ಆದೇಶ ರದ್ದುಪಡಿಸಲಾಗಿದೆ.",
         "unclear": "ಕ್ಷಮಿಸಿ, ನಾನು ಅರ್ಥ ಮಾಡಲಿಲ್ಲ. ದಯವಿಟ್ಟು ಹೌದು ಅಥವಾ ಇಲ್ಲ ಎಂದು ಹೇಳಿ."
-    },
-    "ta": {
-        "confirmed": "உங்கள் ஆர்டர் உறுதி செய்யப்பட்டது. நன்றி.",
-        "cancelled": "உங்கள் ஆர்டர் ரத்து செய்யப்பட்டது.",
-        "unclear": "மன்னிக்கவும், எனக்குப் புரியவில்லை. ஆம் அல்லது இல்லை என்று சொல்லுங்கள்."
-    },
-    "te": {
-        "confirmed": "మీ ఆర్డర్ ఖరారైంది. ధన్యవాదాలు.",
-        "cancelled": "మీ ఆర్డర్ రద్దు చేయబడింది.",
-        "unclear": "క్షమించండి, నాకు అర్థం కాలేదు. అవును లేదా కాదు అని చెప్పండి."
     },
     "mr": {
         "confirmed": "तुमची ऑर्डर कन्फर्म झाली आहे. धन्यवाद.",
@@ -448,7 +465,7 @@ def process_audio(recording_url, call_sid="default", attempt=1):
         try:
             sound = AudioSegment.from_wav(input_file)
             sound = sound.set_frame_rate(16000).set_channels(1).normalize()
-            sound = sound + 10  # Boost volume
+            sound = sound + 15  # Boost volume
             clean_file = f"clean_{call_sid}.wav"
             sound.export(clean_file, format="wav")
             print(f"[{call_sid}] ✅ Audio cleaned and normalized")
@@ -487,11 +504,14 @@ def process_audio(recording_url, call_sid="default", attempt=1):
                     clean_file,
                     task="transcribe",
                     language=None,
+                    temperature=0,
+                    best_of=5,
+                    beam_size=5,
                     fp16=False
                 )
 
                 user_text = result.get("text", "").strip()
-                lang = result.get("language", "en")
+                lang = detect_whisper_language(result, default="en")
 
                 avg_logprob = -1.0
 
@@ -504,17 +524,19 @@ def process_audio(recording_url, call_sid="default", attempt=1):
                 if avg_logprob is None:
                     avg_logprob = -1.0
 
+                # Use script detection plus common keyword matches to fix Whisper language misses.
+                inferred_lang = detect_language_by_script(user_text, default=lang)
                 text_lower = user_text.lower()
+                if inferred_lang == "en" and any(x in text_lower for x in ["haan", "nahi", "hai", "ji", "bilkul"]):
+                    inferred_lang = "hi"
+                elif inferred_lang == "en" and any(x in text_lower for x in ["haudu", "illa", "beda"]):
+                    inferred_lang = "kn"
+                elif inferred_lang == "en" and any(x in text_lower for x in ["hoy", "nako"]):
+                    inferred_lang = "mr"
+                elif inferred_lang == "en" and any(x in text_lower for x in ["yes", "no", "confirm", "order", "cancel", "yeah", "yep"]):
+                    inferred_lang = "en"
 
-                # 🔥 Override Whisper mistakes (VERY IMPORTANT)
-                if any(x in text_lower for x in ["yes", "no", "confirm", "order", "cancel", "yeah", "yep"]):
-                    lang = "en"
-                elif any(x in text_lower for x in ["haan", "nahi", "hai", "haan ji"]):
-                    lang = "hi"
-                elif any(x in text_lower for x in ["haudu", "illa", "beda", "adu", "beku"]):
-                    lang = "kn"
-                elif any(x in text_lower for x in ["hoy", "nako"]):
-                    lang = "mr"
+                lang = inferred_lang
 
                 print(f"[DEBUG] USER TEXT: {user_text}")
                 print(f"[DEBUG] LANG: {lang}")
@@ -524,7 +546,7 @@ def process_audio(recording_url, call_sid="default", attempt=1):
                     decision = "unclear"
                     confidence = "low"
 
-                elif avg_logprob < -1.5 and len(user_text.split()) > 2:
+                elif avg_logprob < -2.5:
                     decision = "unclear"
                     confidence = "low"
 
@@ -564,52 +586,39 @@ def process_audio(recording_url, call_sid="default", attempt=1):
             pass
 
         # 2) MANUAL DECISION LOGIC with native script support 🌐
-        if decision is None or decision != "unclear":  # Determine decision if not already set
+        if decision is None or decision == "unclear":  # Determine decision if not already set
             # 3) Normalize text for consistent keyword matching
-            t = normalize(user_text)
             t = normalize(user_text)
 
             # ---------- YES ----------
             if any(x in t for x in [
                 # English
-                "yes", "yeah", "yep", "ok", "okay", "confirm",
+                "yes", "yeah", "yep", "ok", "okay", "confirm", "sure", "please",
 
                 # Hindi
-                "हाँ", "haan", "ha", "जी", "ji", "bilkul", "theek",
+                "हाँ", "haan", "ha", "h", "ji", "bilkul", "theek", "theek hai", "haan ji",
 
                 # Kannada
-                "ಹೌದು", "haudu", "houdu",
+                "ಹೌದು", "haudu", "houdu", "aavu", "avnu", "avunu",
 
                 # Marathi
-                "होय", "hoy", "hoo", "ya", "thik",
-
-                # Tamil
-                "ஆம்", "aam", "ama", "aama",
-
-                # Telugu
-                "అవును", "avunu"
+                "होय", "hoy", "hoo", "ho", "ya", "thik", "thik ahe"
             ]):
                 decision = "confirmed"
 
             # ---------- NO ----------
             elif any(x in t for x in [
                 # English
-                "no", "nope", "cancel", "stop",
+                "no", "nope", "cancel", "stop", "nah",
 
                 # Hindi
-                "नहीं", "nahi", "nai", "na", "nehi",
+                "नहीं", "nahi", "nai", "na", "nehi", "nahin", "nahi ji",
 
                 # Kannada
-                "ಇಲ್ಲ", "illa", "beda",
+                "ಇಲ್ಲ", "illa", "beda", "bēda", "illa",
 
                 # Marathi
-                "नाही", "nahi", "nako",
-
-                # Tamil
-                "இல்லை", "illai", "venam", "venda",
-
-                # Telugu
-                "కాదు", "kaadu", "ledu"
+                "नाही", "nahi", "nako", "naa", "naahi"
             ]):
                 decision = "cancelled"
 
@@ -640,12 +649,7 @@ def process_audio(recording_url, call_sid="default", attempt=1):
                 "en": "English",
                 "hi": "Hindi",
                 "kn": "Kannada",
-                "mr": "Marathi",
-                "ta": "Tamil",
-                "te": "Telugu",
-                "ur": "Urdu",
-                "bn": "Bengali",
-                "gu": "Gujarati"
+                "mr": "Marathi"
             }
             
             lang_name = lang_name_map.get(lang, lang)
@@ -681,10 +685,6 @@ def process_audio(recording_url, call_sid="default", attempt=1):
         
         t_ai = round(time.time() - ai_start, 2)
 
-        # TEXT -> SPEECH (gTTS) with language mapping
-        tts_start = time.time()
-        out_file = f"static/{call_sid}.mp3"
-        
         # TEXT -> SPEECH (Edge TTS) with high-quality neural voices 🎤
         tts_start = time.time()
         out_file = f"static/{call_sid}.mp3"
@@ -693,11 +693,6 @@ def process_audio(recording_url, call_sid="default", attempt=1):
             "hi": "hi-IN-MadhurNeural",
             "kn": "kn-IN-GaganNeural",
             "mr": "mr-IN-ManoharNeural",
-            "ta": "ta-IN-PallaviNeural",
-            "te": "te-IN-MohanNeural",
-            "ur": "ur-IN-SalmanNeural",
-            "bn": "bn-IN-BashkarNeural",
-            "gu": "gu-IN-NiranjanNeural",
             "en": "en-US-AvaNeural"
         }
         tts_voice = edge_voice_map.get(lang, "en-US-AvaNeural")
