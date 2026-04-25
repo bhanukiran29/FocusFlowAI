@@ -8,7 +8,7 @@ init_db()
 from twilio.rest import Client
 import requests, os
 import re, unicodedata
-import google.generativeai as genai
+from google import genai
 import whisper
 import shutil
 from pydub import AudioSegment
@@ -33,8 +33,9 @@ TWILIO_PHONE = os.getenv("TWILIO_PHONE")
 YOUR_PHONE = os.getenv("YOUR_PHONE")
 PUBLIC_URL = os.getenv("PUBLIC_URL")
 
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-gemini_model = genai.GenerativeModel("gemini-flash-latest")
+# ---------------- MODELS ----------------
+client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+gemini_model_id = "gemini-2.0-flash"  # Using the latest Flash model
 
 # Load Whisper model for accurate multilingual speech recognition
 print("🚀 Loading Whisper model...")
@@ -547,8 +548,11 @@ def process_audio(recording_url, call_sid="default", attempt=1):
                     print(f"[{call_sid}] ⚠️ Unsupported lang '{lang}' detected, forcing to English")
                     lang = "en"
 
-                # 🛑 HALLUCINATION FILTER: If text is garbage or repetitive characters
-                if not user_text or re.search(r"[^\w\s,.?]{3,}", user_text) or len(set(user_text.replace(" ", ""))) < 3 and len(user_text) > 10:
+                # 🛑 HALLUCINATION FILTER: If text is garbage or repetitive
+                words = user_text.split()
+                is_repetitive = len(words) > 5 and (len(set(words)) / len(words)) < 0.3
+                
+                if not user_text or re.search(r"[^\w\s,.?]{3,}", user_text) or is_repetitive or len(set(user_text.replace(" ", ""))) < 3 and len(user_text) > 10:
                     print(f"[{call_sid}] ⚠️ Hallucination detected, treating as unclear")
                     decision = "unclear"
                     confidence = "low"
@@ -678,7 +682,10 @@ def process_audio(recording_url, call_sid="default", attempt=1):
 
                         {reply_en}
                         """
-                        response = gemini_model.generate_content(translate_prompt)
+                        response = client.models.generate_content(
+                            model=gemini_model_id,
+                            contents=translate_prompt
+                        )
                         reply_local = response.text.strip()
                         # Clean up potential markdown formatting or quotes from Gemini
                         reply_local = re.sub(r'["\']', '', reply_local).split('\n')[0].strip()
