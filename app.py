@@ -721,7 +721,7 @@ def process_audio(recording_url, call_sid="default", attempt=1):
         print(f"[{call_sid}] ⏱ stt={t_stt}s ai={t_ai}s tts={t_tts}s total={latency}s")
         
         # 5) CANONICAL VERDICT LINE (one line for all debugging)
-        print(f"[{call_sid}] lang={lang} text='{user_text}' decision={decision} conf={avg_logprob:.2f} tts={tts_lang}")
+        print(f"[{call_sid}] lang={lang} text='{user_text}' decision={decision} conf={avg_logprob:.2f} tts={tts_voice}")
 
         try:
             conn = get_db()
